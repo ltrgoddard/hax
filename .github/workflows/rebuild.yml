@@ -1,8 +1,9 @@
 name: rebuild-patched-hax
 
 # Applies the minimal `extra_tools` patch (in patches/) to the *latest* upstream hax
-# release, builds, and publishes the patched binary as a GitHub Release asset.
-# Rebuilds are triggered weekly, on demand, or when the patch/workflow change.
+# release, builds Linux (x86_64) and macOS (arm64) binaries, and publishes them as
+# GitHub Release assets. Rebuilds are triggered weekly, on demand, or when the
+# patch/workflow change.
 on:
   workflow_dispatch:
   schedule:
@@ -13,22 +14,18 @@ on:
       - '.github/workflows/rebuild.yml'
 
 permissions:
-  contents: write   # to create a release and upload the binary asset
+  contents: write   # to create a release and upload the binary assets
 
 jobs:
-  build:
+  # Determine the latest upstream tag and create (if absent) the patched release.
+  release:
     runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.up.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-
-      - name: install build dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential meson ninja-build pkg-config \
-            libjansson-dev libcurl4-openssl-dev
 
       - name: read latest upstream release tag
         id: up
@@ -37,9 +34,50 @@ jobs:
           echo "tag=$TAG" >> "$GITHUB_OUTPUT"
           echo "latest upstream: $TAG"
 
-      - name: apply patch to a clean upstream checkout at that tag
+      - name: ensure patched release exists
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           TAG="${{ steps.up.outputs.tag }}"
+          REL_TAG="${TAG}-extra_tools"
+          if ! gh release view "$REL_TAG" >/dev/null 2>&1; then
+            gh release create "$REL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "hax ${TAG} + extra_tools (server-side web search)" \
+              --notes "Patched hax for ${TAG} with the extra_tools server-side web search field. See patches/extra_tools_server_side.patch."
+          fi
+          echo "release ${REL_TAG} ready"
+
+  build:
+    needs: release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            deps: |
+              sudo apt-get update
+              sudo apt-get install -y --no-install-recommends \
+                build-essential meson ninja-build pkg-config \
+                libjansson-dev libcurl4-openssl-dev
+          - os: macos-14
+            artifact: macos-arm64
+            deps: |
+              brew install meson ninja pkg-config jansson libcurl
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install build dependencies
+        run: ${{ matrix.deps }}
+
+      - name: apply patch to a clean upstream checkout at the latest tag
+        run: |
+          TAG="${{ needs.release.outputs.tag }}"
           mkdir -p /tmp/src
           git clone --depth 1 --branch "$TAG" \
             https://github.com/OleksandrChekhovskyi/hax.git /tmp/src
@@ -58,14 +96,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          TAG="${{ steps.up.outputs.tag }}"
+          TAG="${{ needs.release.outputs.tag }}"
           REL_TAG="${TAG}-extra_tools"
-          cp /tmp/src/build/hax "hax-${TAG}-extra_tools"
-          if ! gh release view "$REL_TAG" >/dev/null 2>&1; then
-            gh release create "$REL_TAG" \
-              --repo "$GITHUB_REPOSITORY" \
-              --title "hax ${TAG} + extra_tools (server-side web search)" \
-              --notes "Patched hax for ${TAG} with the extra_tools server-side web search field. See patches/extra_tools_server_side.patch."
-          fi
-          gh release upload "$REL_TAG" "hax-${TAG}-extra_tools" --repo "$GITHUB_REPOSITORY" --clobber
-          echo "published hax-${TAG}-extra_tools to release ${REL_TAG}"
+          BIN="hax-${TAG}-extra_tools-${{ matrix.artifact }}"
+          cp /tmp/src/build/hax "$BIN"
+          gh release upload "$REL_TAG" "$BIN" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "published $BIN to release ${REL_TAG}"
