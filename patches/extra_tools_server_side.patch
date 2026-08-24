@@ -1,0 +1,140 @@
+diff --git a/src/providers/config_provider.c b/src/providers/config_provider.c
+index cadde57..99a68f9 100644
+--- a/src/providers/config_provider.c
++++ b/src/providers/config_provider.c
+@@ -48,6 +48,7 @@ static const struct provider_field PROVIDER_FIELDS[] = {
+     {.leaf = "version",             .dialects = PROVIDER_FIELD_ANTHROPIC},
+     {.leaf = "extra_body",          .dialects = FIELD_ANY},
+     {.leaf = "extra_headers",       .dialects = FIELD_ANY, .secret = 1},
++    {.leaf = "extra_tools",         .dialects = FIELD_ANY},
+ };
+ // clang-format on
+ #define N_PROVIDER_FIELDS (sizeof(PROVIDER_FIELDS) / sizeof(PROVIDER_FIELDS[0]))
+@@ -179,6 +180,50 @@ void provider_extra_body_apply(json_t *body, const json_t *extra_body)
+         merge_object_recursive(body, extra_body);
+ }
+ 
++/* Resolve <prefix>.extra_tools: an owned array of raw JSON tool definitions a provider appends to
++ * the request's tool list — for server-side tools hax does not model (e.g. DeepSeek's
++ * "web_search"). Unlike extra_body, these are not owned by hax so they are never dropped. Returns
++ * NULL when unset or not an array of objects; a non-array value warns and is ignored. */
++json_t *provider_extra_tools(const char *config_prefix)
++{
++    if (!config_prefix)
++        return NULL;
++    char *key = xasprintf("%s.extra_tools", config_prefix);
++    const json_t *node = config_json_node(key);
++    json_t *extra_tools = NULL;
++    if (node) {
++        if (json_is_array(node)) {
++            extra_tools = json_deep_copy(node);
++        } else {
++            hax_warn("%s must be a JSON array — ignoring it", key);
++        }
++    }
++    free(key);
++    return extra_tools;
++}
++
++/* Append raw tool definitions (from <prefix>.extra_tools) to the request body's tool list, after
++ * hax has built its own function tools. A NULL `extra_tools` is a no-op. */
++void provider_extra_tools_apply(json_t *body, const json_t *extra_tools)
++{
++    if (!extra_tools || !json_is_array(extra_tools) || json_array_size(extra_tools) == 0)
++        return;
++    json_t *tools = json_object_get(body, "tools");
++    if (!json_is_array(tools)) {
++        /* Some dialects have no tool slot yet (e.g. no function tools on this turn); create one. */
++        tools = json_array();
++        json_object_set_new(body, "tools", tools);
++    }
++    size_t i, n = json_array_size(extra_tools);
++    for (i = 0; i < n; i++) {
++        json_t *def = json_array_get(extra_tools, i);
++        if (json_is_object(def))
++            json_array_append(tools, def);
++        else
++            hax_warn("extra_tools[%zu] is not a JSON object — skipping it", i);
++    }
++}
++
+ /* RFC 7230 field names are tokens; a separator would smuggle in a second header or make curl
+  * fail the whole request rather than this one header. */
+ static int header_name_valid(const char *name)
+diff --git a/src/providers/config_provider.h b/src/providers/config_provider.h
+index 8e33027..5ca135e 100644
+--- a/src/providers/config_provider.h
++++ b/src/providers/config_provider.h
+@@ -78,6 +78,12 @@ json_t *provider_extra_body(const char *config_prefix);
+  * the caller must not mutate `body` afterwards. */
+ void provider_extra_body_apply(json_t *body, const json_t *extra_body);
+ 
++/* Resolve <prefix>.extra_tools: an owned array of raw JSON tool definitions appended to each
++ * request's tool list (server-side tools hax does not model), or NULL.
++ * `provider_extra_tools_apply` appends them after hax builds its own function tools. */
++json_t *provider_extra_tools(const char *config_prefix);
++void provider_extra_tools_apply(json_t *body, const json_t *extra_tools);
++
+ /* Resolve <prefix>.extra_headers, an object of header name/value members, into an owned
+  * NULL-terminated array of "Name: value" strings for every request to the provider, or NULL.
+  * A "$NAME" value reads the environment variable NAME, like an inline api_key. Invalid names
+diff --git a/src/providers/http_provider.c b/src/providers/http_provider.c
+index 9e15971..4c04f29 100644
+--- a/src/providers/http_provider.c
++++ b/src/providers/http_provider.c
+@@ -58,6 +58,7 @@ struct http_provider {
+     int cache_default; /* Messages cache_control default; chat uses cache_mode */
+     char **extra_headers;
+     json_t *extra_body;
++    json_t *extra_tools;
+ 
+     const char *length_hint;    /* borrowed for the provider lifetime */
+     const char *const *efforts; /* borrowed for the provider lifetime */
+@@ -255,6 +256,7 @@ static int http_provider_stream(struct provider *base, const struct context *con
+     struct http_stream stream = {.provider = provider, .wire = wire};
+     struct wire_body_opts opts = {
+         .extra_body = provider->extra_body,
++        .extra_tools = provider->extra_tools,
+         .cache_ttl = provider->cache_ttl,
+     };
+ 
+@@ -326,6 +328,7 @@ static void http_provider_destroy(struct provider *base)
+     free(provider->reasoning_field);
+     string_array_free(provider->extra_headers);
+     json_decref(provider->extra_body);
++    json_decref(provider->extra_tools);
+     free(provider);
+ }
+ 
+@@ -623,6 +626,7 @@ struct provider *http_provider_new_preset(const struct http_provider_preset *pre
+         string_array_concat(preset->extra_headers, (const char *const *)config_headers);
+     string_array_free(config_headers);
+     provider->extra_body = provider_extra_body(preset->config_prefix);
++    provider->extra_tools = provider_extra_tools(preset->config_prefix);
+ 
+     provider->length_hint = preset->length_hint;
+     provider->efforts = preset->efforts;
+diff --git a/src/providers/wire.c b/src/providers/wire.c
+index 260ba40..32e7c78 100644
+--- a/src/providers/wire.c
++++ b/src/providers/wire.c
+@@ -19,6 +19,7 @@ char *wire_build_body(const struct wire *wire, const struct context *context,
+ {
+     json_t *body = wire->build_body(context, provider_id, model, opts);
+     provider_extra_body_apply(body, opts->extra_body);
++    provider_extra_tools_apply(body, opts->extra_tools);
+     char *json = json_dumps(body, JSON_COMPACT);
+     json_decref(body);
+     return json;
+diff --git a/src/providers/wire.h b/src/providers/wire.h
+index 5093fc9..21aee4b 100644
+--- a/src/providers/wire.h
++++ b/src/providers/wire.h
+@@ -33,6 +33,7 @@ struct wire_events_opts {
+ /* Per-request body options. Wires read only the fields their dialect defines. */
+ struct wire_body_opts {
+     const json_t *extra_body; /* user passthrough, merged over the finished body */
++    const json_t *extra_tools; /* server-side tool defs appended to the built tool list */
+     /* chat + anthropic: send explicit cache markers with this ttl */
+     int cache_markers;
+     const char *cache_ttl;

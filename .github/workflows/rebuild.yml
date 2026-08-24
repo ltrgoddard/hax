@@ -1,0 +1,71 @@
+name: rebuild-patched-hax
+
+# Applies the minimal `extra_tools` patch (in patches/) to the *latest* upstream hax
+# release, builds, and publishes the patched binary as a GitHub Release asset.
+# Rebuilds are triggered weekly, on demand, or when the patch/workflow change.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 5 * * 1'   # weekly Monday 05:30 UTC
+  push:
+    paths:
+      - 'patches/**'
+      - '.github/workflows/rebuild.yml'
+
+permissions:
+  contents: write   # to create a release and upload the binary asset
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config \
+            libjansson-dev libcurl4-openssl-dev
+
+      - name: read latest upstream release tag
+        id: up
+        run: |
+          TAG=$(curl -fsSL https://api.github.com/repos/OleksandrChekhovskyi/hax/releases/latest | jq -r '.tag_name')
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "latest upstream: $TAG"
+
+      - name: apply patch to a clean upstream checkout at that tag
+        run: |
+          TAG="${{ steps.up.outputs.tag }}"
+          mkdir -p /tmp/src
+          git clone --depth 1 --branch "$TAG" \
+            https://github.com/OleksandrChekhovskyi/hax.git /tmp/src
+          cp "patches/extra_tools_server_side.patch" /tmp/src/
+          cd /tmp/src
+          git apply --verbose extra_tools_server_side.patch
+
+      - name: build patched hax
+        run: |
+          cd /tmp/src
+          meson setup build
+          ninja -C build
+          ./build/hax --version
+
+      - name: publish patched binary as a release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.up.outputs.tag }}"
+          REL_TAG="${TAG}-extra_tools"
+          cp /tmp/src/build/hax "hax-${TAG}-extra_tools"
+          if ! gh release view "$REL_TAG" >/dev/null 2>&1; then
+            gh release create "$REL_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "hax ${TAG} + extra_tools (server-side web search)`n" \
+              --generate-notes
+          fi
+          gh release upload "$REL_TAG" "hax-${TAG}-extra_tools" --repo "$GITHUB_REPOSITORY" --clobber
+          echo "published hax-${TAG}-extra_tools to release ${REL_TAG}"
