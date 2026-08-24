@@ -64,8 +64,8 @@ jobs:
           if ! gh release view "$REL_TAG" >/dev/null 2>&1; then
             gh release create "$REL_TAG" \
               --repo "$GITHUB_REPOSITORY" \
-              --title "hax ${TAG} + extra_tools (server-side web search)`n" \
-              --generate-notes
+              --title "hax ${TAG} + extra_tools (server-side web search)" \
+              --notes "Patched hax for ${TAG} with the extra_tools server-side web search field. See patches/extra_tools_server_side.patch."
           fi
           gh release upload "$REL_TAG" "hax-${TAG}-extra_tools" --repo "$GITHUB_REPOSITORY" --clobber
           echo "published hax-${TAG}-extra_tools to release ${REL_TAG}"
