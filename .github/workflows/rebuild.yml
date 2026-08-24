@@ -50,6 +50,7 @@ jobs:
 
   build:
     needs: release
+    name: build (${{ matrix.artifact }})
     strategy:
       fail-fast: false
       matrix:
@@ -64,7 +65,7 @@ jobs:
           - os: macos-14
             artifact: macos-arm64
             deps: |
-              brew install meson ninja pkg-config jansson libcurl
+              brew install meson ninja pkg-config jansson curl
 
     runs-on: ${{ matrix.os }}
     steps:
